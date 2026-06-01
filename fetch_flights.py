@@ -1,18 +1,14 @@
 """
-fetch_flights.py
-Busca voos programados do dia na API SIROS/ANAC (gratuita, sem autenticacao).
-Filtra por aeroporto(s) configurado(s) e salva em data/{ICAO}.json.
+fetch_flights.py — SIROS/ANAC + Supabase v1.0
+Busca voos do dia via API SIROS e insere/atualiza no Supabase.
+Nao salva mais arquivos JSON no repositorio.
 
-Variaveis de ambiente:
-  AIRPORTS  -> ICAOs separados por virgula (ex: SBCA,SBGR)
-               Padrao: SBCA
+Variaveis de ambiente (GitHub Secrets):
+  SUPABASE_URL         -> URL do projeto Supabase (ex: https://XXXX.supabase.co)
+  SUPABASE_SERVICE_KEY -> service_role key (acesso total para escrita)
 
-Documentacao da API:
-  https://sas.anac.gov.br/sas/siros_api/
-
-Endpoints utilizados:
-  /api/voos?dataReferencia=DDMMAAAA   -> voos do dia
-  /api/aerodromo?sg_aerodromo_icao_ou_iata=ICAO -> dados do aeroporto
+Variaveis de ambiente (GitHub Variables):
+  AIRPORTS             -> ICAOs separados por virgula (ex: SBCA,SBGR,SBCT)
 """
 
 import json
@@ -20,357 +16,208 @@ import os
 from datetime import datetime, timezone, timedelta
 
 import requests
+from supabase import create_client
+
+# ── Credenciais Supabase ──────────────────────────────────────────────────────
+
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "").strip()
+SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_KEY", "").strip()
+
+if not SUPABASE_URL or not SUPABASE_KEY:
+    print("[ERRO] SUPABASE_URL e SUPABASE_SERVICE_KEY sao obrigatorios.")
+    print("       Configure-os como GitHub Secrets no repositorio.")
+    raise SystemExit(1)
+
+db = create_client(SUPABASE_URL, SUPABASE_KEY)
+print(f"Supabase conectado: {SUPABASE_URL}")
 
 # ── Configuracoes ─────────────────────────────────────────────────────────────
 
-API_BASE     = "https://sas.anac.gov.br/sas/siros_api/api"
+API_BASE     = "https://sas.anac.gov.br/sas/siros_api"
 airports_env = os.environ.get("AIRPORTS", "SBCA")
 AIRPORTS     = [a.strip().upper() for a in airports_env.split(",") if a.strip()]
 
-# Horario de Brasilia: UTC-3
-BRT = timezone(timedelta(hours=-3))
-
-# Data de hoje em Brasilia no formato ddMMaaaa exigido pela API
+BRT      = timezone(timedelta(hours=-3))
 hoje     = datetime.now(BRT)
-data_ref = hoje.strftime("%d%m%Y")        # ex: 10052026
-data_iso = hoje.strftime("%Y-%m-%d")      # ex: 2026-05-10
+data_ref = hoje.strftime("%d%m%Y")      # formato SIROS: DDMMYYYY
+data_iso = hoje.strftime("%Y-%m-%d")    # formato banco: YYYY-MM-DD
 
-print(f"SIROS/ANAC — Buscando voos para: {hoje.strftime('%d/%m/%Y')} (Brasilia)")
-print(f"Aeroportos configurados: {', '.join(AIRPORTS)}")
+print(f"Data de referencia: {hoje.strftime('%d/%m/%Y')} (BRT)")
+print(f"Aeroportos: {', '.join(AIRPORTS)}")
 
-# Mapa de companias aereas (ICAO -> nome)
+# ── Mapeamentos ───────────────────────────────────────────────────────────────
+
 AIRLINES = {
-    "GLO": "GOL",
-    "TAM": "LATAM",
-    "AZU": "Azul",
-    "ONE": "VOEPASS",
-    "PTB": "Passaredo",
-    "COA": "Copa Airlines",
-    "AAL": "American Airlines",
-    "UAL": "United Airlines",
-    "DAL": "Delta Air Lines",
-    "AFR": "Air France",
-    "DLH": "Lufthansa",
-    "IBE": "Iberia",
-    "KLM": "KLM",
-    "LAN": "LATAM",
-    "AEA": "Air Europa",
+    "GLO":"GOL","TAM":"LATAM","AZU":"Azul","ONE":"VOEPASS",
+    "PTB":"Passaredo","TAP":"TAP Portugal","DAL":"Delta",
+    "UAL":"United","AFR":"Air France","DLH":"Lufthansa",
+    "IBE":"Iberia","AAL":"American Airlines","AVA":"Avianca",
+    "BAW":"British Airways","UAE":"Emirates","THY":"Turkish Airlines",
+    "SKU":"Sky Airline","CMP":"Copa Airlines","LAN":"LATAM Internacional",
 }
 
-# Mapa de equipamentos (ICAO -> nome legivel)
 EQUIPAMENTOS = {
-    "A20N": "Airbus A320neo",
-    "A21N": "Airbus A321neo",
-    "A319": "Airbus A319",
-    "A320": "Airbus A320",
-    "A321": "Airbus A321",
-    "A332": "Airbus A330-200",
-    "A333": "Airbus A330-300",
-    "A343": "Airbus A340-300",
-    "A359": "Airbus A350-900",
-    "B737": "Boeing 737",
-    "B738": "Boeing 737-800",
-    "B739": "Boeing 737-900",
-    "B38M": "Boeing 737 MAX 8",
-    "B763": "Boeing 767-300",
-    "B772": "Boeing 777-200",
-    "B77W": "Boeing 777-300ER",
-    "B788": "Boeing 787-8",
-    "B789": "Boeing 787-9",
-    "E190": "Embraer E190",
-    "E195": "Embraer E195",
-    "E295": "Embraer E195-E2",
-    "AT76": "ATR 72",
-    "AT75": "ATR 72-500",
-    "DH8D": "Dash 8-400",
-    "C208": "Cessna Caravan",
+    "A20N":"Airbus A320neo","A21N":"Airbus A321neo","A319":"Airbus A319",
+    "A320":"Airbus A320","A321":"Airbus A321","A332":"Airbus A330-200",
+    "A333":"Airbus A330-300","A339":"Airbus A330-900neo",
+    "A359":"Airbus A350-900","B737":"Boeing 737","B738":"Boeing 737-800",
+    "B38M":"Boeing 737 MAX 8","B748":"Boeing 747-8","B763":"Boeing 767-300",
+    "B77W":"Boeing 777-300ER","B788":"Boeing 787-8","B789":"Boeing 787-9",
+    "E190":"Embraer E190","E195":"Embraer E195","E295":"Embraer E195-E2",
+    "AT76":"ATR 72",
 }
 
-# Mapa de tipos de operacao
-TIPO_OPERACAO = {
-    "D": "Domestico",
-    "I": "Internacional",
-}
+def get_airline(icao: str) -> str:
+    return AIRLINES.get((icao or "").strip().upper(), (icao or "?").strip())
 
-TIPO_SERVICO = {
-    "P": "Passageiros",
-    "C": "Carga",
-    "M": "Misto",
-}
+def get_equip(icao: str) -> str:
+    return EQUIPAMENTOS.get((icao or "").strip().upper(), (icao or "").strip() or None)
 
+def get_tipo_operacao(ds_tipo_servico: str) -> str:
+    s = (ds_tipo_servico or "").upper()
+    return "Internacional" if "INTERNAC" in s else "Domestico"
 
-def get_airline_name(icao_empresa: str) -> str:
-    if not icao_empresa:
-        return "?"
-    code = icao_empresa.strip().upper()
-    return AIRLINES.get(code, code)
-
-
-def get_equipment_name(icao_equip: str) -> str:
-    if not icao_equip:
-        return "?"
-    code = icao_equip.strip().upper()
-    return EQUIPAMENTOS.get(code, code)
-
-
-def converter_utc_para_brt(horario_utc: str, data_base: str) -> str:
-    """
-    Converte horario no formato HH:MM (UTC) para BRT (UTC-3).
-    data_base no formato YYYY-MM-DD.
-    Retorna string no formato HH:MM.
-    """
-    if not horario_utc or len(horario_utc) < 5:
-        return horario_utc or "?"
+def parse_siros_dt(dt_str: str) -> str | None:
+    """Converte 'DD/MM/YYYY HH:MM' (UTC) para ISO com timezone UTC."""
+    if not dt_str or len(dt_str) < 16:
+        return None
     try:
-        hora, minuto = int(horario_utc[:2]), int(horario_utc[3:5])
-        dt_utc = datetime.fromisoformat(f"{data_base}T{hora:02d}:{minuto:02d}:00+00:00")
-        dt_brt = dt_utc.astimezone(BRT)
-        return dt_brt.strftime("%H:%M")
+        dt = datetime.strptime(dt_str.strip(), "%d/%m/%Y %H:%M")
+        return dt.replace(tzinfo=timezone.utc).isoformat()
     except Exception:
-        return horario_utc
+        return None
 
-
-def parse_datetime_brt(dt_str: str) -> str:
-    """
-    Converte datetime string da API (varios formatos possiveis) para ISO com BRT.
-    """
-    if not dt_str:
-        return ""
+def parse_hora(dt_str: str) -> str | None:
+    """Extrai apenas HH:MM:00 de 'DD/MM/YYYY HH:MM'."""
+    if not dt_str or len(dt_str) < 16:
+        return None
     try:
-        # Tenta formato ISO com timezone
-        if "T" in dt_str:
-            dt = datetime.fromisoformat(dt_str.replace("Z", "+00:00"))
-            return dt.astimezone(BRT).isoformat()
-        # Tenta formato de data+hora separado por espaco
-        if " " in dt_str:
-            dt = datetime.fromisoformat(dt_str)
-            dt_utc = dt.replace(tzinfo=timezone.utc)
-            return dt_utc.astimezone(BRT).isoformat()
-        return dt_str
+        return dt_str.strip()[11:16] + ":00"
     except Exception:
-        return dt_str
+        return None
 
 
-def buscar_voos_do_dia() -> list:
-    """
-    Busca todos os voos programados para hoje via endpoint /api/voos.
-    Retorna lista de dicionarios com os dados de cada voo.
-    """
+# ── Busca todos os voos do dia no SIROS ───────────────────────────────────────
+
+def buscar_voos_siros() -> list:
     url = f"{API_BASE}/voos"
-    params = {"dataReferencia": data_ref}
-
+    print(f"\nGET {url}?dataReferencia={data_ref}")
     try:
-        print(f"\nRequisicao: GET {url}?dataReferencia={data_ref}")
-        r = requests.get(url, params=params, timeout=60)
+        r = requests.get(url, params={"dataReferencia": data_ref}, timeout=60)
         r.raise_for_status()
-
-        # A API pode retornar JSON array ou string CSV
-        content_type = r.headers.get("content-type", "")
-        raw = r.text.strip()
-
-        # Tenta interpretar como JSON
-        if raw.startswith("[") or raw.startswith("{"):
-            data = r.json()
-            if isinstance(data, list):
-                print(f"  Retorno: {len(data)} voos no total (JSON)")
-                return data
-            elif isinstance(data, dict):
-                # Pode estar em uma chave como "data" ou "voos"
-                for key in ("data", "voos", "result", "results"):
-                    if key in data and isinstance(data[key], list):
-                        print(f"  Retorno: {len(data[key])} voos no total (JSON key={key})")
-                        return data[key]
-            return []
-
-        # Tenta interpretar como CSV com separador ";"
-        if ";" in raw:
-            linhas = [l for l in raw.splitlines() if l.strip()]
-            if not linhas:
-                return []
-
-            # Primeira linha pode ser cabecalho
-            cabecalho = [c.strip() for c in linhas[0].split(";")]
-
-            # Verifica se e realmente um cabecalho (contem texto nao numerico)
-            if any(not c[:1].isdigit() for c in cabecalho[:3]):
-                dados = linhas[1:]
-            else:
-                # Sem cabecalho — usa nomes padrao da documentacao
-                cabecalho = [
-                    "dt_inicio", "cd_icao_empresa", "nr_etapa", "nr_voo",
-                    "cd_icao_equipamento", "qt_assentos", "cd_icao_origem",
-                    "dt_hr_partida_prevista", "cd_icao_destino",
-                    "dt_hr_chegada_prevista", "tp_operacao", "codeshare"
-                ]
-                dados = linhas
-
-            result = []
-            for linha in dados:
-                cols = [c.strip() for c in linha.split(";")]
-                voo = {}
-                for i, campo in enumerate(cabecalho):
-                    voo[campo] = cols[i] if i < len(cols) else ""
-                result.append(voo)
-
-            print(f"  Retorno: {len(result)} voos no total (CSV)")
-            return result
-
-        print(f"  [AVISO] Formato de resposta nao reconhecido.")
-        return []
-
-    except requests.exceptions.HTTPError as e:
-        print(f"  [ERRO] HTTP {r.status_code}: {e}")
+        decoded = r.json()
+        if isinstance(decoded, str):
+            decoded = json.loads(decoded)
+        if isinstance(decoded, list):
+            print(f"  Total retornado pela API: {len(decoded)} voos")
+            return decoded
         return []
     except Exception as e:
         print(f"  [ERRO] Falha ao buscar voos: {e}")
         return []
 
 
-def buscar_dados_aerodromo(icao: str) -> dict:
-    """
-    Busca dados complementares de um aeroporto via /api/aerodromo.
-    """
-    url = f"{API_BASE}/aerodromo"
+# ── Normaliza um voo para o schema do banco ────────────────────────────────────
+
+def normalizar_voo(f: dict) -> dict:
+    empresa  = (f.get("sg_empresa_icao")          or "").strip()
+    nr_voo   = (f.get("nr_voo")                   or "").strip().lstrip("0") or "0"
+    etapa    = str(f.get("nr_etapa")              or "1").strip()
+    equip    = (f.get("sg_equipamento_icao")       or "").strip()
+    assentos = f.get("qt_assentos_previstos")
+    partida  = (f.get("dt_partida_prevista_utc")  or "").strip()
+    chegada  = (f.get("dt_chegada_prevista_utc")  or "").strip()
+    tipo_srv = (f.get("ds_tipo_servico")           or "").strip()
+    origem   = (f.get("sg_icao_origem")            or "").strip().upper()
+    destino  = (f.get("sg_icao_destino")           or "").strip().upper()
+
+    return {
+        "data_referencia": data_iso,
+        "icao_empresa":    empresa or None,
+        "nome_empresa":    get_airline(empresa),
+        "numero_voo":      nr_voo,
+        "etapa":           etapa,
+        "icao_origem":     origem or None,
+        "icao_destino":    destino or None,
+        "hr_partida_utc":  parse_hora(partida),
+        "hr_chegada_utc":  parse_hora(chegada),
+        "partida_iso":     parse_siros_dt(partida),
+        "chegada_iso":     parse_siros_dt(chegada),
+        "equipamento":     get_equip(equip) or None,
+        "assentos":        int(assentos) if assentos and str(assentos).isdigit() else None,
+        "tipo_operacao":   get_tipo_operacao(tipo_srv),
+        "tipo_servico":    tipo_srv or None,
+    }
+
+
+# ── Registra execucao no banco ────────────────────────────────────────────────
+
+def registrar_execucao(aeroportos: list, inseridos: int, atualizados: int, status: str, obs: str = "") -> None:
     try:
-        r = requests.get(url, params={"sg_aerodromo_icao_ou_iata": icao}, timeout=30)
-        r.raise_for_status()
-        data = r.json()
-        if isinstance(data, list) and data:
-            return data[0]
-        if isinstance(data, dict):
-            return data
-        return {}
+        db.table("execucoes").insert({
+            "concluido_em":       datetime.now(timezone.utc).isoformat(),
+            "aeroportos_buscados": aeroportos,
+            "voos_inseridos":     inseridos,
+            "voos_atualizados":   atualizados,
+            "status":             status,
+            "observacao":         obs or None,
+        }).execute()
     except Exception as e:
-        print(f"  [AVISO] Nao foi possivel buscar dados do aerodromo {icao}: {e}")
-        return {}
-
-
-def normalizar_campo(voo: dict, *chaves) -> str:
-    """Tenta multiplas chaves possiveis e retorna o primeiro valor encontrado."""
-    for chave in chaves:
-        val = voo.get(chave, "")
-        if val:
-            return str(val).strip()
-    return ""
-
-
-def filtrar_e_normalizar(todos_voos: list, icao: str) -> tuple[list, list]:
-    """
-    Filtra os voos pelo aeroporto ICAO (como origem OU destino)
-    e normaliza os campos para o formato de saida.
-    """
-    chegadas   = []
-    partidas   = []
-
-    # Possiveis nomes de campo para aeroporto de origem e destino
-    campos_origem  = ("cd_icao_origem", "icaoOrigem", "sg_icao_origem",
-                      "aeroporto_origem", "origem_icao", "dep_icao")
-    campos_destino = ("cd_icao_destino", "icaoDestino", "sg_icao_destino",
-                      "aeroporto_destino", "destino_icao", "arr_icao")
-    campos_empresa = ("cd_icao_empresa", "icaoEmpresa", "empresa_icao", "cia_icao")
-    campos_voo     = ("nr_voo", "numeroVoo", "numero_voo", "flight_number")
-    campos_equip   = ("cd_icao_equipamento", "equipamento", "equip_icao", "equipment")
-    campos_partida = ("dt_hr_partida_prevista", "horarioPartida", "hr_partida",
-                      "partida_prevista", "departure_scheduled")
-    campos_chegada = ("dt_hr_chegada_prevista", "horarioChegada", "hr_chegada",
-                      "chegada_prevista", "arrival_scheduled")
-    campos_assento = ("qt_assentos", "quantidadeAssentos", "assentos", "seats")
-    campos_op      = ("tp_operacao", "tipoOperacao", "tipo_operacao", "operation_type")
-    campos_etapa   = ("nr_etapa", "numeroEtapa", "etapa")
-
-    for voo in todos_voos:
-        origem  = normalizar_campo(voo, *campos_origem).upper()
-        destino = normalizar_campo(voo, *campos_destino).upper()
-
-        if origem != icao and destino != icao:
-            continue
-
-        empresa   = normalizar_campo(voo, *campos_empresa)
-        nr_voo    = normalizar_campo(voo, *campos_voo)
-        equip     = normalizar_campo(voo, *campos_equip)
-        partida   = normalizar_campo(voo, *campos_partida)
-        chegada   = normalizar_campo(voo, *campos_chegada)
-        assentos  = normalizar_campo(voo, *campos_assento)
-        tp_op     = normalizar_campo(voo, *campos_op)
-        etapa     = normalizar_campo(voo, *campos_etapa)
-
-        registro = {
-            "callsign":          f"{empresa}{nr_voo}".strip() or "?",
-            "numero_voo":        nr_voo,
-            "airline_icao":      empresa,
-            "airline":           get_airline_name(empresa),
-            "equipamento_icao":  equip,
-            "equipamento":       get_equipment_name(equip),
-            "assentos":          assentos,
-            "etapa":             etapa,
-            "tipo_operacao":     TIPO_OPERACAO.get(tp_op.upper(), tp_op or "Domestico"),
-            "origem_icao":       origem,
-            "destino_icao":      destino,
-            "partida_utc":       partida,
-            "chegada_utc":       chegada,
-            "partida_brt":       parse_datetime_brt(partida),
-            "chegada_brt":       parse_datetime_brt(chegada),
-            "status":            "programado",   # SIROS so tem voos planejados
-            "fonte":             "SIROS/ANAC",
-        }
-
-        if destino == icao:
-            registro["rota"] = origem
-            chegadas.append(registro)
-
-        if origem == icao:
-            registro["rota"] = destino
-            partidas.append(registro)
-
-    # Ordena pelo horario de partida/chegada
-    chegadas.sort(key=lambda x: x.get("chegada_brt") or "")
-    partidas.sort(key=lambda x: x.get("partida_brt") or "")
-
-    return chegadas, partidas
+        print(f"  [AVISO] Nao foi possivel registrar execucao: {e}")
 
 
 # ── Execucao principal ────────────────────────────────────────────────────────
 
-os.makedirs("data", exist_ok=True)
-
-# Busca todos os voos do dia uma unica vez
-todos_voos = buscar_voos_do_dia()
+todos_voos = buscar_voos_siros()
+total_inseridos  = 0
+total_atualizados = 0
 
 if not todos_voos:
-    print("\n[AVISO] Nenhum voo retornado pela API. Salvando arquivos vazios.")
+    print("\n[AVISO] Nenhum voo retornado. Encerrando.")
+    registrar_execucao(AIRPORTS, 0, 0, "sem_dados", "API SIROS nao retornou voos.")
+    raise SystemExit(0)
 
-# Processa cada aeroporto configurado
-for icao in AIRPORTS:
-    print(f"\nProcessando {icao}...")
+# Filtra apenas voos dos aeroportos configurados e normaliza
+registros = []
+for f in todos_voos:
+    origem  = (f.get("sg_icao_origem")  or "").strip().upper()
+    destino = (f.get("sg_icao_destino") or "").strip().upper()
 
-    # Dados do aeroporto
-    dados_aerodromo = buscar_dados_aerodromo(icao)
-    nome_aerodromo  = (
-        dados_aerodromo.get("nm_aerodromo")
-        or dados_aerodromo.get("nome")
-        or dados_aerodromo.get("name")
-        or icao
-    )
+    if origem not in AIRPORTS and destino not in AIRPORTS:
+        continue
 
-    chegadas, partidas = filtrar_e_normalizar(todos_voos, icao)
-    print(f"  Filtrado: {len(chegadas)} chegadas, {len(partidas)} partidas")
+    # Valida campos obrigatorios
+    empresa = (f.get("sg_empresa_icao") or "").strip()
+    nr_voo  = (f.get("nr_voo")          or "").strip()
+    if not empresa or not nr_voo or not origem or not destino:
+        continue
 
-    output = {
-        "updated_at":     datetime.now(timezone.utc).isoformat(),
-        "data_referencia": data_iso,
-        "airport_icao":   icao,
-        "airport_name":   nome_aerodromo,
-        "airport_info":   dados_aerodromo,
-        "source":         "SIROS/ANAC",
-        "source_url":     "https://sas.anac.gov.br/sas/siros_api/",
-        "arrivals":       chegadas,
-        "departures":     partidas,
-    }
+    registros.append(normalizar_voo(f))
 
-    path = f"data/{icao}.json"
-    with open(path, "w", encoding="utf-8") as fh:
-        json.dump(output, fh, ensure_ascii=False, indent=2)
+print(f"\nVoos filtrados para os aeroportos configurados: {len(registros)}")
 
-    print(f"  Salvo em: {path}")
+if registros:
+    # Upsert em lotes de 500 para evitar timeout
+    LOTE = 500
+    for i in range(0, len(registros), LOTE):
+        lote = registros[i:i+LOTE]
+        try:
+            resultado = db.table("voos").upsert(
+                lote,
+                on_conflict="data_referencia,icao_empresa,numero_voo,icao_origem,icao_destino,etapa"
+            ).execute()
+            total_inseridos += len(lote)
+            print(f"  Lote {i//LOTE + 1}: {len(lote)} registros enviados ao Supabase")
+        except Exception as e:
+            print(f"  [ERRO] Falha no lote {i//LOTE + 1}: {e}")
 
-print("\nConcluido.")
+registrar_execucao(
+    AIRPORTS,
+    total_inseridos,
+    total_atualizados,
+    "concluido",
+    f"Data: {data_iso} | Aeroportos: {', '.join(AIRPORTS)}"
+)
+
+print(f"\nConcluido — {total_inseridos} registros enviados ao Supabase.")
+print(f"Painel: {SUPABASE_URL.replace('https://', 'https://app.supabase.com/project/')}")
